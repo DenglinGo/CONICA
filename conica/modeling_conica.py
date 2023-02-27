@@ -65,7 +65,7 @@ def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] 
     return inverted_mask.masked_fill(inverted_mask.bool(), torch.finfo(dtype).min)
 
 
-class COCALearnedPositionalEmbedding(nn.Embedding):
+class CONICALearnedPositionalEmbedding(nn.Embedding):
     """
     This module learns positional embeddings up to a fixed maximum size.
     """
@@ -82,7 +82,7 @@ class COCALearnedPositionalEmbedding(nn.Embedding):
         return super().forward(positions)
 
 
-class COCAAttention(nn.Module):
+class CONICAAttention(nn.Module):
     def __init__(
             self,
             embed_dim: int,
@@ -223,14 +223,14 @@ class COCAAttention(nn.Module):
         return attn_output, attn_weights_reshaped, past_key_value
 
 
-class COCAEncoderLayer(nn.Module):
-    def __init__(self, config: COCAConfig):
+class CONICAEncoderLayer(nn.Module):
+    def __init__(self, config: CONICAConfig):
         super().__init__()
         self.pre_layer_norm = config.pre_layer_norm
         self.embed_dim = config.d_model
         self.self_attn_layer_norm = nn.LayerNorm(self.embed_dim, config.layer_norm_eps)
 
-        self.self_attn = COCAAttention(
+        self.self_attn = CONICAAttention(
             embed_dim=self.embed_dim,
             num_heads=config.encoder_attention_heads,
             dropout=config.dropout
@@ -301,14 +301,14 @@ class COCAEncoderLayer(nn.Module):
         return outputs
 
 
-class COCADecoderLayer(nn.Module):
-    def __init__(self, config: COCAConfig, cross_attention=True):
+class CONICADecoderLayer(nn.Module):
+    def __init__(self, config: CONICAConfig, cross_attention=True):
         super().__init__()
 
         self.pre_layer_norm = config.pre_layer_norm
         self.embed_dim = config.d_model
         self.self_attn_layer_norm = nn.LayerNorm(self.embed_dim, config.layer_norm_eps)
-        self.self_attn = COCAAttention(
+        self.self_attn = CONICAAttention(
             embed_dim=self.embed_dim,
             num_heads=config.decoder_attention_heads,
             dropout=config.dropout,
@@ -323,7 +323,7 @@ class COCADecoderLayer(nn.Module):
         if cross_attention:
             self.cross_attn_layer_norm = nn.LayerNorm(self.embed_dim, config.layer_norm_eps)
 
-            self.cross_attn = COCAAttention(
+            self.cross_attn = CONICAAttention(
                 self.embed_dim,
                 config.decoder_attention_heads,
                 dropout=config.dropout,
@@ -434,7 +434,7 @@ class COCADecoderLayer(nn.Module):
 
 
 class PredictionHead(nn.Module):
-    def __init__(self, config: COCAConfig):
+    def __init__(self, config: CONICAConfig):
         super().__init__()
         self.transform = nn.Linear(config.d_model, config.d_model)
         self.activation_fn = ACT2FN[config.activation_function]
@@ -446,8 +446,8 @@ class PredictionHead(nn.Module):
         return self.decoder(output)
 
 
-class COCAPretrainedModel(PreTrainedModel):
-    config_class = COCAConfig
+class CONICAPretrainedModel(PreTrainedModel):
+    config_class = CONICAConfig
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
     _keys_to_ignore_on_load_unexpected = [r"encoder\.version", r"decoder\.version"]
@@ -470,12 +470,12 @@ class COCAPretrainedModel(PreTrainedModel):
             module.weight.data.fill_(1.0)
 
     def _set_gradient_checkpointing(self, module, value=False):
-        if isinstance(module, (COCAEncoder, COCADecoder)):
+        if isinstance(module, (CONICAEncoder, CONICADecoder)):
             module.gradient_checkpointing = value
 
 
-class COCAEncoder(COCAPretrainedModel):
-    def __init__(self, config: COCAConfig):
+class CONICAEncoder(CONICAPretrainedModel):
+    def __init__(self, config: CONICAConfig):
         super().__init__(config)
 
         self.embed_visual = nn.Linear(config.d_visual, config.d_model)
@@ -483,7 +483,7 @@ class COCAEncoder(COCAPretrainedModel):
         embed_dim = config.d_model
         self.padding_idx = config.pad_token_id
         self.embed_scale = math.sqrt(embed_dim) if config.scale_embedding else 1.0
-        self.layers = nn.ModuleList([COCAEncoderLayer(config) for _ in range(config.encoder_layers)])
+        self.layers = nn.ModuleList([CONICAEncoderLayer(config) for _ in range(config.encoder_layers)])
         self.layernorm_embedding = nn.LayerNorm(embed_dim, config.layer_norm_eps)
         self.gradient_checkpointing = False
         # Initialize weights and apply final processing
@@ -595,8 +595,8 @@ class COCAEncoder(COCAPretrainedModel):
         )
 
 
-class COCADecoder(COCAPretrainedModel):
-    def __init__(self, config: COCAConfig):
+class CONICADecoder(CONICAPretrainedModel):
+    def __init__(self, config: CONICAConfig):
         super().__init__(config)
 
         self.dropout = config.dropout
@@ -604,10 +604,10 @@ class COCADecoder(COCAPretrainedModel):
         self.padding_idx = config.pad_token_id
         self.embed_scale = math.sqrt(embed_dim) if config.scale_embedding else 1.0
         self.layers = nn.ModuleList(
-            [COCADecoderLayer(config, cross_attention=False) for _ in range(config.unimodal_decoder_layers)] + [
-                COCADecoderLayer(config, cross_attention=True) for _ in range(config.multimodal_decoder_layers)])
+            [CONICADecoderLayer(config, cross_attention=False) for _ in range(config.unimodal_decoder_layers)] + [
+                CONICADecoderLayer(config, cross_attention=True) for _ in range(config.multimodal_decoder_layers)])
         self.embed_tokens = nn.Embedding(config.vocab_size, config.d_model, self.padding_idx)
-        self.embed_positions = COCALearnedPositionalEmbedding(
+        self.embed_positions = CONICALearnedPositionalEmbedding(
             config.max_position_embeddings,
             config.d_model,
         )
@@ -851,11 +851,11 @@ class COCADecoder(COCAPretrainedModel):
         )
 
 
-class COCAModel(COCAPretrainedModel):
-    def __init__(self, config: COCAConfig):
+class CONICAModel(CONICAPretrainedModel):
+    def __init__(self, config: CONICAConfig):
         super().__init__(config)
-        self.encoder = COCAEncoder(config)
-        self.decoder = COCADecoder(config)
+        self.encoder = CONICAEncoder(config)
+        self.decoder = CONICADecoder(config)
         self.post_init()
 
     def get_encoder(self):
@@ -960,12 +960,12 @@ class COCAModel(COCAPretrainedModel):
         )
 
 
-class COCAModelWithCoCa(COCAPretrainedModel, COCAGeneration):
-    def __init__(self, config: COCAConfig,
+class CONICAModelWithCONICA(CONICAPretrainedModel, CONICAGeneration):
+    def __init__(self, config: CONICAConfig,
                  seq_per_image: int,
                  ):
         super().__init__(config)
-        self.model = COCAModel(config)
+        self.model = CONICAModel(config)
         self.encoder_proj = nn.Sequential(
             nn.LayerNorm(config.d_model, config.layer_norm_eps) if config.pre_layer_norm else nn.Identity(),
             nn.Linear(config.d_model, config.d_align)
@@ -986,7 +986,7 @@ class COCAModelWithCoCa(COCAPretrainedModel, COCAGeneration):
         config_momentum = deepcopy(config)
         config_momentum.multimodal_decoder_layers = 0
 
-        self.model_m = COCAModel(config_momentum)
+        self.model_m = CONICAModel(config_momentum)
         self.encoder_proj_m = nn.Sequential(
             nn.LayerNorm(config.d_model, config.layer_norm_eps) if config.pre_layer_norm else nn.Identity(),
             nn.Linear(config.d_model, config.d_align)

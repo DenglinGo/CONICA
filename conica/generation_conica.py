@@ -10,8 +10,8 @@ from typing import Optional, Union
 import torch
 import torch.distributed as dist
 from torch import nn
-from transformers.generation_utils import LogitsProcessorList, StoppingCriteriaList
-from transformers.generation_utils import torch_int_div, validate_stopping_criteria, GenerationMixin, SampleOutput, \
+from transformers.generation.utils import LogitsProcessorList, StoppingCriteriaList
+from transformers.generation.utils import torch_int_div, validate_stopping_criteria, GenerationMixin, SampleOutput, \
     SampleEncoderDecoderOutput, SampleDecoderOnlyOutput, BeamSearchScorer, BeamSearchOutput, \
     BeamSearchEncoderDecoderOutput, \
     BeamSearchDecoderOnlyOutput
@@ -315,9 +315,7 @@ class CONICAGeneration(GenerationMixin):
         beam_scores[:, 1:] = -1e9
         beam_scores = beam_scores.view((batch_size * num_beams,))
         image_embeds = None
-        text_embeds = None
         this_peer_finished = False  # used by synced_gpus only
-        similarity = None
         logprobs = None
         count_similarity = self.config.count_similarity
 
@@ -381,13 +379,11 @@ class CONICAGeneration(GenerationMixin):
                 image_embeds = self.encoder_proj(outputs.encoder_hidden_states[-1][:, 0])
                 image_embeds = nn.functional.normalize(image_embeds, dim=-1)
                 expanded_return_idx = torch.arange(image_embeds.shape[0]).view(-1, 1).repeat(1, num_beams).view(
-                    -1).to(
-                    image_embeds.device)
+                    -1).to(image_embeds.device)
                 image_embeds = image_embeds.index_select(0, expanded_return_idx)
             _model_kwargs = self._update_model_kwargs_for_generation(
                 outputs, model_kwargs, is_encoder_decoder=self.config.is_encoder_decoder
             )
-
             _input_ids = torch.cat((input_ids, torch.zeros((batch_size * num_beams, 1), device=input_ids.device,
                                                            dtype=torch.long).fill_(eos_token_id)), dim=1)
             _inputs = self.prepare_inputs_for_generation(_input_ids, **_model_kwargs)
@@ -420,8 +416,9 @@ class CONICAGeneration(GenerationMixin):
             beam_idx = beam_outputs["next_beam_indices"]
             beam_logprobs = beam_outputs["next_beam_logprobs"]
             input_ids = torch.cat([input_ids[beam_idx, :], beam_next_tokens.unsqueeze(-1)], dim=-1)
-            logprobs = beam_logprobs.unsqueeze(-1) if logprobs is None else torch.cat(
-                [logprobs[beam_idx, :], beam_logprobs.unsqueeze(-1)], dim=-1)
+            logprobs = beam_logprobs.unsqueeze(-1) if logprobs is None else torch.cat([logprobs[beam_idx, :],
+                                                                                        beam_logprobs.unsqueeze(-1)],
+                                                                                        dim=-1)
             model_kwargs = self._update_model_kwargs_for_generation(
                 outputs, model_kwargs, is_encoder_decoder=self.config.is_encoder_decoder
             )

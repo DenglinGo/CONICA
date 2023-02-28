@@ -26,19 +26,6 @@ from copy import deepcopy
 logger = logging.get_logger(__name__)
 
 
-def droppath(x, p: float = 0., training: bool = False):
-    """Drop paths (Stochastic Depth) per sample (when applied in main path of residual blocks).
-    """
-    if p == 0. or not training:
-        return x
-    keep_prob = 1 - p
-    shape = (x.shape[0],) + (1,) * (x.ndim - 1)  # work with diff dim tensors, not just 2D ConvNets
-    random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
-    random_tensor.floor_()  # binarize
-    output = x.div(keep_prob) * random_tensor
-    return output
-
-
 def _make_causal_mask(input_ids_shape: torch.Size, dtype: torch.dtype, past_key_values_length: int = 0):
     """
     Make causal mask used for bi-directional self-attention.
@@ -137,21 +124,20 @@ class CONICAAttention(nn.Module):
             key_states = past_key_value[0]
             value_states = past_key_value[1]
         elif is_cross_attention:
-            # decoder cross_attention
+            # decoder cross_attention without pre-computed k,v
             key_states = self._shape(self.k_proj(key_value_states), -1, bsz)
             value_states = self._shape(self.v_proj(key_value_states), -1, bsz)
         elif past_key_value is not None:
             # decoder self_attention
-            # reuse k, v,
+            # reuse k, v
             key_states = self._shape(self.k_proj(hidden_states), -1, bsz)
             value_states = self._shape(self.v_proj(hidden_states), -1, bsz)
             key_states = torch.cat([past_key_value[0], key_states], dim=2)
             value_states = torch.cat([past_key_value[1], value_states], dim=2)
         else:
-            # encoder/decoder self_attention
+            # encoder/decoder self_attention without pask key and value
             key_states = self._shape(self.k_proj(hidden_states), -1, bsz)
             value_states = self._shape(self.v_proj(hidden_states), -1, bsz)
-
         if self.is_decoder:
             # if cross_attention save Tuple(torch.Tensor, torch.Tensor) of all cross attention key/value_states.
             # Further calls to cross_attention layer can then reuse all cross-attention
@@ -233,11 +219,11 @@ class CONICAEncoderLayer(nn.Module):
         self.self_attn = CONICAAttention(
             embed_dim=self.embed_dim,
             num_heads=config.encoder_attention_heads,
-            dropout=config.dropout
+            dropout=config.dropout,
+            bias=config.bias
         )
 
         self.dropout = config.dropout
-        self.droppath = config.droppath
         self.activation_fn = ACT2FN[config.activation_function]
 
         self.fc_layer_norm = nn.LayerNorm(self.embed_dim, config.layer_norm_eps)
@@ -272,7 +258,6 @@ class CONICAEncoderLayer(nn.Module):
             output_attentions=output_attentions,
         )
         hidden_states = dropout(hidden_states, p=self.dropout, training=self.training)
-        hidden_states = droppath(hidden_states, p=self.droppath, training=self.training)
         hidden_states = residual + hidden_states
         if not self.pre_layer_norm:
             hidden_states = self.self_attn_layer_norm(hidden_states)
@@ -283,7 +268,6 @@ class CONICAEncoderLayer(nn.Module):
         hidden_states = dropout(hidden_states, p=self.dropout, training=self.training)
         hidden_states = self.out_proj(hidden_states)
         hidden_states = dropout(hidden_states, p=self.dropout, training=self.training)
-        hidden_states = droppath(hidden_states, p=self.droppath, training=self.training)
         hidden_states = residual + hidden_states
         if not self.pre_layer_norm:
             hidden_states = self.fc_layer_norm(hidden_states)
@@ -380,7 +364,6 @@ class CONICADecoderLayer(nn.Module):
             output_attentions=output_attentions,
         )
         hidden_states = dropout(hidden_states, p=self.dropout, training=self.training)
-        hidden_states = droppath(hidden_states, p=self.droppath, training=self.training)
         hidden_states = residual + hidden_states
         if not self.pre_layer_norm:
             hidden_states = self.self_attn_layer_norm(hidden_states)
@@ -405,7 +388,6 @@ class CONICADecoderLayer(nn.Module):
                 output_attentions=output_attentions,
             )
             hidden_states = dropout(hidden_states, p=self.dropout, training=self.training)
-            hidden_states = droppath(hidden_states, p=self.droppath, training=self.training)
             hidden_states = residual + hidden_states
 
             if not self.pre_layer_norm:
@@ -420,7 +402,6 @@ class CONICADecoderLayer(nn.Module):
         hidden_states = dropout(hidden_states, p=self.dropout, training=self.training)
         hidden_states = self.out_proj(hidden_states)
         hidden_states = dropout(hidden_states, p=self.dropout, training=self.training)
-        hidden_states = droppath(hidden_states, p=self.droppath, training=self.training)
         hidden_states = residual + hidden_states
 
         if not self.pre_layer_norm:
@@ -431,19 +412,6 @@ class CONICADecoderLayer(nn.Module):
         if use_cache:
             outputs += (present_key_value,)
         return outputs
-
-
-class PredictionHead(nn.Module):
-    def __init__(self, config: CONICAConfig):
-        super().__init__()
-        self.transform = nn.Linear(config.d_model, config.d_model)
-        self.activation_fn = ACT2FN[config.activation_function]
-        self.layer_norm = nn.LayerNorm(config.d_model, eps=config.layer_norm_eps)
-        self.decoder = nn.Linear(config.d_model, config.vocab_size)
-
-    def forward(self, input):
-        output = self.layer_norm(self.activation_fn(self.transform(input)))
-        return self.decoder(output)
 
 
 class CONICAPretrainedModel(PreTrainedModel):
@@ -478,8 +446,9 @@ class CONICAEncoder(CONICAPretrainedModel):
     def __init__(self, config: CONICAConfig):
         super().__init__(config)
 
-        self.embed_visual = nn.Linear(config.d_visual, config.d_model)
+        self.embed_visual = nn.Linear(config.d_visual, config.d_model, bias=config.bias)
         self.dropout = config.dropout
+        self.layerdrop = config.encoder_layerdrop
         embed_dim = config.d_model
         self.padding_idx = config.pad_token_id
         self.embed_scale = math.sqrt(embed_dim) if config.scale_embedding else 1.0
@@ -487,8 +456,8 @@ class CONICAEncoder(CONICAPretrainedModel):
         self.layernorm_embedding = nn.LayerNorm(embed_dim, config.layer_norm_eps)
         self.gradient_checkpointing = False
         # Initialize weights and apply final processing
-        self.final_layer_norm = nn.LayerNorm(config.d_model,
-                                             config.layer_norm_eps) if config.pre_layer_norm else nn.Identity()
+        self.final_layer_norm = nn.LayerNorm(config.d_model, config.layer_norm_eps) \
+                               if config.pre_layer_norm else nn.Identity()
 
         self.post_init()
 
@@ -620,6 +589,13 @@ class CONICADecoder(CONICAPretrainedModel):
         # Initialize weights and apply final processing
         self.post_init()
 
+
+    def get_input_embeddings(self):
+        return self.embed_tokens
+
+    def set_input_embeddings(self, value):
+        self.embed_tokens = value
+
     def _prepare_decoder_attention_mask(self, attention_mask, input_shape, inputs_embeds, past_key_values_length):
         # create causal mask
         # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
@@ -744,7 +720,7 @@ class CONICADecoder(CONICAPretrainedModel):
             inputs_embeds = self.embed_tokens(input_ids) * self.embed_scale
 
         # expand encoder attention mask
-        if encoder_attention_mask is not None:
+        if encoder_hidden_states is not None and encoder_attention_mask is not None:
             # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
             encoder_attention_mask = _expand_mask(encoder_attention_mask, inputs_embeds.dtype, tgt_len=input_shape[-1])
 
@@ -809,10 +785,8 @@ class CONICADecoder(CONICAPretrainedModel):
                     attention_mask=attention_mask,
                     encoder_hidden_states=encoder_hidden_states,
                     encoder_attention_mask=encoder_attention_mask,
-                    layer_head_mask=(head_mask[idx] if head_mask is not None else None),
-                    cross_attn_layer_head_mask=(
-                        cross_attn_head_mask[idx] if cross_attn_head_mask is not None else None
-                    ),
+                    layer_head_mask=head_mask[idx] if head_mask is not None else None,
+                    cross_attn_layer_head_mask=cross_attn_head_mask[idx] if cross_attn_head_mask is not None else None,
                     past_key_value=past_key_value,
                     output_attentions=output_attentions,
                     use_cache=use_cache,
@@ -929,7 +903,7 @@ class CONICAModel(CONICAPretrainedModel):
         if self.training:
             encoder_hidden_states = encoder_hidden_states[:, 1:]
             if attention_mask is not None:
-                attention_mask = attention_mask[..., 1:, 1:]
+                attention_mask = attention_mask[..., 1:]
         decoder_outputs = self.decoder(
             input_ids=decoder_input_ids,
             attention_mask=decoder_attention_mask,
@@ -966,6 +940,7 @@ class CONICAModelWithCONICA(CONICAPretrainedModel, CONICAGeneration):
                  ):
         super().__init__(config)
         self.model = CONICAModel(config)
+        self.predict_dropout = config.predict_dropout
         self.encoder_proj = nn.Sequential(
             nn.LayerNorm(config.d_model, config.layer_norm_eps) if config.pre_layer_norm else nn.Identity(),
             nn.Linear(config.d_model, config.d_align)
@@ -975,7 +950,7 @@ class CONICAModelWithCONICA(CONICAPretrainedModel, CONICAGeneration):
             nn.Linear(config.d_model, config.d_align)
         )
 
-        self.lm_head = nn.Linear(config.d_model,config.vocab_size,bias=False)
+        self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
 
         self.tau = nn.Parameter(torch.ones([]) * config.tau)
 
@@ -1139,7 +1114,7 @@ class CONICAModelWithCONICA(CONICAPretrainedModel, CONICAGeneration):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
         )
-        lm_logits = self.lm_head(outputs[0])
+        lm_logits = self.lm_head(dropout(outputs[0],p=self.predict_dropout,training=self.training))
         loss = None
 
         if labels is not None:
@@ -1193,7 +1168,8 @@ class CONICAModelWithCONICA(CONICAPretrainedModel, CONICAGeneration):
                 for i in range(len(sim_i2t)):
                     sim_i2t_target[i, i * expand_size:(i + 1) * expand_size] = 1 / expand_size
                     sim_t2i_target[i * expand_size:(i + 1) * expand_size, i] = 1
-                co_loss = (cross_entropy(sim_i2t, sim_i2t_target) + cross_entropy(sim_t2i, sim_t2i_target)) / 2 * self.config.co_weight
+                co_loss = (cross_entropy(sim_i2t, sim_i2t_target) + cross_entropy(sim_t2i,
+                                                                                  sim_t2i_target)) / 2 * self.config.co_weight
                 loss = co_loss
                 self._dequeue_and_enqueue(image_embeds_m, text_embeds_m)
 

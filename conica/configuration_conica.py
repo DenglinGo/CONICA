@@ -11,6 +11,7 @@ class CONICAConfig(PretrainedConfig):
 
     def __init__(
             self,
+            bias=True,
             vocab_size=49408,
             d_visual=2304,
             d_align=128,
@@ -27,7 +28,7 @@ class CONICAConfig(PretrainedConfig):
             pre_layer_norm=False,
             d_model=512,
             dropout=0.1,
-            droppath=0.1,
+            predict_dropout=0.5,
             init_std=0.02,
             scale_embedding=False,
             use_cache=True,
@@ -48,9 +49,10 @@ class CONICAConfig(PretrainedConfig):
             alpha=0.5,
             xe_weight=2,
             co_weight=1,
-            count_similarity=False,
+            count_similarity=True,
             **kwargs
     ):
+        self.bias = bias
         self.vocab_size = vocab_size
         self.d_visual = d_visual
         self.tau = tau
@@ -65,7 +67,7 @@ class CONICAConfig(PretrainedConfig):
         self.decoder_ffn_dim = decoder_ffn_dim
         self.decoder_attention_heads = decoder_attention_heads
         self.dropout = dropout
-        self.droppath = droppath
+        self.predict_dropout = predict_dropout
         self.activation_function = activation_function
         self.layer_norm_eps = layer_norm_eps
         self.pre_layer_norm = pre_layer_norm

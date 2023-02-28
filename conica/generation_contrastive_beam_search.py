@@ -5,7 +5,7 @@
 import copy
 
 import torch
-from transformers.generation_beam_search import BeamScorer
+from transformers.generation.beam_search import BeamScorer
 from typing import List, Optional, Tuple
 import warnings
 from collections import UserDict
@@ -37,8 +37,8 @@ class ContrastiveBeamHypotheses:
         Add a new hypothesis to the list.
         """
         if count_similarity:
-            score = self.alpha * math.exp(sum_logprobs / (hyp.shape[-1] ** self.length_penalty)) + (
-                    1 - self.alpha) * similarity.item()
+            score = self.alpha * math.exp(sum_logprobs / (hyp.shape[-1] ** self.length_penalty)) +\
+                    (1 - self.alpha) * similarity.item()
         else:
             score = sum_logprobs / (hyp.shape[-1] ** self.length_penalty)
         if len(self) < self.num_beams or score > self.worst_score:

@@ -47,7 +47,7 @@ class CONICAConfig(PretrainedConfig):
             tau=0.07,
             output_hidden_states=True,
             alpha=0.5,
-            xe_weight=2,
+            xe_weight=1,
             co_weight=1,
             count_similarity=True,
             **kwargs

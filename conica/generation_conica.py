@@ -10,8 +10,8 @@ from typing import Optional, Union
 import torch
 import torch.distributed as dist
 from torch import nn
-from transformers.generation.utils import LogitsProcessorList, StoppingCriteriaList
-from transformers.generation.utils import torch_int_div, validate_stopping_criteria, GenerationMixin, SampleOutput, \
+from transformers.generation_utils import LogitsProcessorList, StoppingCriteriaList
+from transformers.generation_utils import torch_int_div, validate_stopping_criteria, GenerationMixin, SampleOutput, \
     SampleEncoderDecoderOutput, SampleDecoderOnlyOutput, BeamSearchScorer, BeamSearchOutput, \
     BeamSearchEncoderDecoderOutput, \
     BeamSearchDecoderOnlyOutput

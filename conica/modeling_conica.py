@@ -934,7 +934,7 @@ class CONICAModel(CONICAPretrainedModel):
         )
 
 
-class CONICAModelWithCONICA(CONICAPretrainedModel, CONICAGeneration):
+class CONICAModelWithLMHead(CONICAPretrainedModel, CONICAGeneration):
     def __init__(self, config: CONICAConfig,
                  seq_per_image: int,
                  ):

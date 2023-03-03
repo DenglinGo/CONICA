@@ -18,6 +18,7 @@ import argparse
 import os
 import numpy as np
 from tqdm import tqdm
+from timm.models.vision_transformer import resize_pos_embed
 
 
 class ImageDataset(Dataset):
@@ -38,45 +39,61 @@ class ImageDataset(Dataset):
 
 
 class ImageFeatureProjection(nn.Module):
-    def __init__(self, model_name):
+    def __init__(self, model_name, input_r, output_r, patch_l):
         super().__init__()
+        num_patches = (input_r // patch_l) ** 2 if patch_l is not None else (input_r // 32) ** 2
         if model_name in clip.available_models():
             clip_model, _ = clip.load(model_name)
             clip_model.to(device='cpu', dtype=torch.float)
             self.visual = clip_model.visual
         elif model_name in timm.list_models():
             self.visual = timm.create_model(model_name, pretrained=True)
-
         else:
             raise NotImplementedError
+        self.global_pool = None
         if isinstance(self.visual, ModifiedResNet):
-            self.visual.positional_embedding = self.visual.attnpool.positional_embedding
+            positional_embedding = nn.Parameter(
+                torch.zeros(1, 1 + num_patches, self.visual.attnpool.positional_embedding.size(-1)))
+            resized_positional_embedding = resize_pos_embed(self.visual.attnpool.positional_embedding.unsqueeze(0),
+                                                            positional_embedding)
+            self.global_pool = self.visual.attnpool
+            self.global_pool.positional_embedding = nn.Parameter(resized_positional_embedding.squeeze(0), )
             self.visual.attnpool = nn.Identity()
         elif isinstance(self.visual, VisionTransformer):
-            self.visual.ln_post = None
-            self.visual.proj = None
+            positional_embedding = nn.Parameter(
+                torch.zeros(1, 1 + num_patches, self.visual.positional_embedding.size(-1)))
+            resized_positional_embedding = resize_pos_embed(self.visual.positional_embedding.unsqueeze(0),
+                                                            positional_embedding)
+            self.visual.positional_embedding = nn.Parameter(resized_positional_embedding.squeeze(0), )
         elif isinstance(self.visual, timm.models.ResNet):
+            self.global_pool = self.visual.global_pool
             self.visual.global_pool = nn.Identity()
             self.visual.fc = nn.Identity()
         elif isinstance(self.visual, timm.models.efficientnet.EfficientNet):
+            self.global_pool = nn.Sequential(
+                self.visual.conv_head,
+                self.visual.global_pool
+            )
             self.visual.conv_head = nn.Identity()
             self.visual.global_pool, self.visual.classifier = nn.Identity(), nn.Identity()
         elif isinstance(self.visual, timm.models.SwinTransformer):
+            self.global_pool = self.visual.avgpool
             self.visual.avgpool = nn.Identity()
             self.visual.head = nn.Identity()
-
         else:
             raise NotImplementedError
+        self.pooling = nn.AdaptiveAvgPool2d((output_r, output_r))
 
     @torch.no_grad()
     def forward(self, x):
         if isinstance(self.visual, ModifiedResNet):
             x = self.visual(x)
-            x = x.reshape(x.shape[0], x.shape[1], x.shape[2] * x.shape[3]).permute(2, 0, 1)  # NCHW -> (HW)NC
-            x = torch.cat([x.mean(dim=0, keepdim=True), x], dim=0)  # (HW+1)NC
-            x = x + self.visual.positional_embedding[:, None, :].to(x.dtype)  # (HW+1)NC
+            g = self.global_pool(
+                x.reshape(x.shape[0], x.shape[1], x.shape[2] * x.shape[3]).permute(2, 0, 1))  # NCHW -> (HW)NC
+
         elif isinstance(self.visual, VisionTransformer):
             x = self.visual.conv1(x)  # shape = [*, width, grid, grid]
+            grid = x.shape[-1]
             x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
             x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
             x = torch.cat(
@@ -88,40 +105,56 @@ class ImageFeatureProjection(nn.Module):
             x = x.permute(1, 0, 2)  # NLD -> LND
             x = self.visual.transformer(x)
             x = x.permute(1, 0, 2)  # LND -> NLD
+            g = self.visual.ln_post(x[:, 0, :])  # ND
+            if self.visual.proj is not None:
+                g = g @ self.visual.proj
+            x = x[:, 1:, :].permute(0, 2, 1)
+            x = x.reshape(x.shape[0], -1, grid, grid)  # [N,width,grid,grid]
 
-        elif isinstance(self.visual, (timm.models.ResNet,timm.models.efficientnet.EfficientNet)):
+
+        elif isinstance(self.visual, (timm.models.ResNet, timm.models.efficientnet.EfficientNet)):
             x = self.visual(x)
-            x = x.reshape(x.shape[0], x.shape[1], x.shape[2] * x.shape[3]).permute(0,2,1)  # NCHW -> N(HW)C
+            g = self.global_pool(x)  # ND1
+
         elif isinstance(self.visual, timm.models.SwinTransformer):
             x = self.visual.patch_embed(x)
             if self.visual.absolute_pos_embed is not None:
                 x = x + self.visual.absolute_pos_embed
             x = self.visual.pos_drop(x)
             x = self.visual.layers(x)  # NLD
+            g = self.global_pool(x.transpose(1, 2))
+            g = torch.flatten(g, 1)
+
+
         else:
             raise NotImplementedError
-        return x
+        x = self.pooling(x)
+        x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
+        x = x.permute(0, 2, 1)
+        return g.unsqueeze(1), x
 
 
 if __name__ == "__main__":
     warnings.filterwarnings("ignore")
     parser = argparse.ArgumentParser()
-    parser.add_argument('-batch_size', type=int, default=64, help='batch size for dataloader')
-    parser.add_argument('-n_px', type=int, default=336, help='')
-    parser.add_argument('-model_name', type=str, default='tf_efficientnet_l2_ns', help='')
+    parser.add_argument('-batch_size', type=int, default=128, help='batch size for dataloader')
+    parser.add_argument('-input_resolution', type=int, default=336, help='')
+    parser.add_argument('-output_resolution', type=int, default=16, help='')
+    parser.add_argument('-patch_length', type=int, default=14, help='')
+    parser.add_argument('-model_name', type=str, default='ViT-L/14@336px', help='')
     parser.add_argument('-gpu', type=bool, default=True, help='use gpu or not')
     parser.add_argument('-dataset', type=str, default='/dataset/caption/mscoco/images/val2014',
                         help='path of dataset')
     parser.add_argument('-save_path', type=str, default='/dataset/caption/mscoco/features/', help='path of dataset')
     args = parser.parse_args()
     device = torch.device("cuda:0" if args.gpu else "cpu")
-    n_px = args.n_px
-    prepocess = _transform(n_px)
+    prepocess = _transform(args.input_resolution)
     dataset_path = args.dataset
     save_path = args.save_path
     model_name = args.model_name
 
-    proj = ImageFeatureProjection(model_name).to(device)
+    proj = ImageFeatureProjection(model_name, input_r=args.input_resolution, output_r=args.output_resolution,
+                                  patch_l=args.patch_length).to(device)
     proj.eval()
     dataset = ImageDataset(dataset_path, prepocess)
     if not op.exists(op.join(save_path, model_name)):
@@ -133,5 +166,8 @@ if __name__ == "__main__":
             features = proj(imgs.to(device))
             for i, filename in enumerate(filenames):
                 id = int(filename.split('.')[0].split('_')[-1])
-                feature = features[i]
-                np.save(op.join(args.save_path, model_name, str(id)), feature.cpu().float().numpy())
+
+                g_feature, l_features = features[0][i], features[1][i]
+                np.savez_compressed(op.join(args.save_path, model_name, str(id)),
+                                    l_features=l_features.cpu().float().numpy(),
+                                    g_feature=g_feature.cpu().float().numpy())

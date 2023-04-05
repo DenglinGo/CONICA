@@ -82,7 +82,8 @@ class ImageFeatureProjection(nn.Module):
             self.visual.head = nn.Identity()
         else:
             raise NotImplementedError
-        self.pooling = nn.AdaptiveAvgPool2d((output_r, output_r))
+
+        self.pooling = nn.AdaptiveAvgPool2d((output_r, output_r)) if output_r!=input_r//patch_l else nn.Identity()
 
     @torch.no_grad()
     def forward(self, x):
@@ -137,9 +138,9 @@ class ImageFeatureProjection(nn.Module):
 if __name__ == "__main__":
     warnings.filterwarnings("ignore")
     parser = argparse.ArgumentParser()
-    parser.add_argument('-batch_size', type=int, default=128, help='batch size for dataloader')
+    parser.add_argument('-batch_size', type=int, default=64, help='batch size for dataloader')
     parser.add_argument('-input_resolution', type=int, default=336, help='')
-    parser.add_argument('-output_resolution', type=int, default=16, help='')
+    parser.add_argument('-output_resolution', type=int, default=24, help='')
     parser.add_argument('-patch_length', type=int, default=14, help='')
     parser.add_argument('-model_name', type=str, default='ViT-L/14@336px', help='')
     parser.add_argument('-gpu', type=bool, default=True, help='use gpu or not')
@@ -160,7 +161,7 @@ if __name__ == "__main__":
     if not op.exists(op.join(save_path, model_name)):
         os.makedirs(op.join(save_path, model_name))
 
-    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=12, pin_memory=True)
+    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=12, pin_memory=False)
     with torch.no_grad():
         for filenames, imgs in tqdm(dataloader):
             features = proj(imgs.to(device))

@@ -5,7 +5,7 @@
 import copy
 
 import torch
-from transformers.generation.beam_search import BeamScorer
+from transformers.generation_beam_search import BeamScorer
 from typing import List, Optional, Tuple
 import warnings
 from collections import UserDict

@@ -1,13 +1,13 @@
 python train.py \
 --config_name conica-clip_rn \
---max_features_len 49 \
---feature_path /dataset/caption/mscoco/features/RN50x4 \
---output_dir output/clip-RN50x4/xe/checkpoints \
+--max_features_len 256 \
+--feature_path /dataset/caption/mscoco/features/ViT-L/14@336px \
+--output_dir output/clip-vit_xe/checkpoints \
 --do_train \
 --evaluation_strategy epoch \
 --logging_strategy steps \
 --logging_steps 100 \
---logging_dir output/clip-RN50x4/xe/logs \
+--logging_dir output/clip-vit_xe/logs \
 --save_strategy epoch \
 --per_device_train_batch_size 64 \
 --per_device_eval_batch_size 32 \

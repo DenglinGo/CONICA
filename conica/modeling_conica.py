@@ -2,78 +2,94 @@
 # @Time : 2023/2/27 下午3:11
 # @Author : Lingo
 # @File : modeling_conica.py
-from transformers.modeling_outputs import ModelOutput, BaseModelOutputWithPast
+import copy
+from transformers.modeling_outputs import BaseModelOutputWithPooling, \
+    BaseModelOutputWithPoolingAndCrossAttentions, Seq2SeqModelOutput, Seq2SeqLMOutput
 from torch.distributed import get_world_size, all_gather
 from .configuration_conica import ConicaConfig
 from typing import Optional, Tuple
 from torch import nn
+import torch.utils.checkpoint
 from transformers.activations import ACT2FN
-from torch.nn.functional import softmax, dropout, cross_entropy, pad
+from torch.nn.functional import softmax, dropout, cross_entropy, normalize
 from transformers.utils import logging
 from transformers import PreTrainedModel
 import torch
-import math
 import os
-from copy import deepcopy
+from .generation_conica import ConicaGeneration
 
 logger = logging.get_logger(__name__)
 from dataclasses import dataclass
 
 
-def droppath(x, p: float = 0., training: bool = False):
+@dataclass
+class Seq2SeqModelOutputWithPooling(Seq2SeqModelOutput):
+    pooler_output: Tuple[torch.FloatTensor] = None
+
+
+@dataclass()
+class Seq2SeqLMOutputWithPooling(Seq2SeqLMOutput):
+    pooler_output: Tuple[torch.FloatTensor] = None
+
+
+def droppath(x, p: float = 0., training: bool = False, scale_by_keep=True):
     """Drop paths (Stochastic Depth) per sample (when applied in main path of residual blocks).
     """
     if p == 0. or not training:
         return x
     keep_prob = 1 - p
     shape = (x.shape[0],) + (1,) * (x.ndim - 1)  # work with diff dim tensors, not just 2D ConvNets
-    random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
-    random_tensor.floor_()  # binarize
-    output = x.div(keep_prob) * random_tensor
-    return output
+    random_tensor = x.new_empty(shape).bernoulli_(keep_prob)
+    if keep_prob > 0.0 and scale_by_keep:
+        random_tensor.div_(keep_prob)
+    return x * random_tensor
 
-@dataclass
-class ConicaForContrastiveGenerationModelOutput(ModelOutput):
+
+def _make_causal_mask(input_ids_shape: torch.Size, dtype: torch.dtype, past_key_values_length: int = 0):
     """
-    cross_attentions: Optional[Tuple[torch.FloatTensor]] = None
-        Class defining the outputs of [`CONICAForContrastiveGenerationModelOutput`].
+    Make causal mask used for bi-directional self-attention.
+    """
+    bsz, tgt_len = input_ids_shape
+    mask = torch.full((tgt_len, tgt_len), float("-inf"))
+    mask_cond = torch.arange(mask.size(-1))
+    mask.masked_fill_(mask_cond < (mask_cond + 1).view(mask.size(-1), 1), 0)
+    mask = mask.to(dtype)
 
-        Args:
-            loss (`torch.FloatTensor`, *optional*, returned when `labels` is provided, `torch.FloatTensor` of shape `(1,)`):
-                Language modeling loss from the language model.
-            logits (`torch.FloatTensor` of shape `(batch_size, sequence_length, config.vocab_size)`):
-                Prediction scores of the language modeling head of the language model.
-            unimodal_vision_outputs (`torch.FloatTensor`):
-                Outputs of the unimocal vision encoder.
-            unimodal_language_outputs (`torch.FloatTensor`):
-                Outputs of the unimocal language encoder.
-        """
-
-    loss: Optional[torch.FloatTensor] = None
-    logits: Optional[torch.FloatTensor] = None
-    unimodal_vision_outputs: Optional[torch.FloatTensor] = None
-    unimodal_language_outputs: Optional[torch.FloatTensor] = None
+    if past_key_values_length > 0:
+        mask = torch.cat([torch.zeros(tgt_len, past_key_values_length, dtype=dtype), mask], dim=-1)
+    return mask[None, None, :, :].expand(bsz, 1, tgt_len, tgt_len + past_key_values_length)
 
 
-@dataclass
-class ConicaForUnimocalVisionOutput(ModelOutput):
-    unimodal_vision_global_outputs: Optional[torch.FloatTensor] = None
-    unimodal_vision_local_outputs: Optional[torch.FloatTensor] = None
-    last_hidden_state: torch.FloatTensor = None
-    hidden_states: Optional[Tuple[torch.FloatTensor]] = None
-    attentions: Optional[Tuple[torch.FloatTensor]] = None
+def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] = None):
+    bsz, src_len = mask.size()
+    tgt_len = tgt_len if tgt_len is not None else src_len
+
+    expanded_mask = mask[:, None, None, :].expand(bsz, 1, tgt_len, src_len).to(dtype)
+
+    inverted_mask = 1.0 - expanded_mask
+
+    return inverted_mask.masked_fill(inverted_mask.bool(), torch.finfo(dtype).min)
 
 
-@dataclass
-class ConicaForUnimocalTextOutput(ModelOutput):
-    unimodal_text_global_outputs: Optional[torch.FloatTensor] = None
-    unimodal_text_local_outputs: Optional[torch.FloatTensor] = None
-    last_hidden_state: torch.FloatTensor = None
-    past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
-    hidden_states: Optional[Tuple[torch.FloatTensor]] = None
-    attentions: Optional[Tuple[torch.FloatTensor]] = None
-    cross_attentions: Optional[Tuple[torch.FloatTensor]] = None,
-    attn_mask: Optional[Tuple[torch.FloatTensor]] = None
+class SinusoidEncoding(nn.Module):
+    def __init__(self, max_len, d_model):
+        super().__init__()
+        dim = torch.arange(d_model // 2, dtype=torch.float32).unsqueeze(0) / d_model
+        pos = torch.arange(max_len, dtype=torch.float32).unsqueeze(1)
+        sin = torch.sin(pos / 10000 ** (2 * dim))
+        cos = torch.cos(pos / 10000 ** (2 * dim))
+        pos_encoding = torch.zeros(max_len, d_model)
+
+        pos_encoding[:, ::2] = sin
+        pos_encoding[:, 1::2] = cos
+        self.register_buffer("pos_encoding", pos_encoding)
+
+    def forward(self, input_ids: torch.Tensor, past_key_values_length: int = 0):
+        """`input_ids_shape` is expected to be [bsz x seqlen]."""
+        bsz, seq_len = input_ids.shape[:2]
+        positions = self.pos_encoding[past_key_values_length:past_key_values_length + seq_len].unsqueeze(0).repeat(bsz,
+                                                                                                                   1, 1)
+        return positions
 
 
 class ConicaLearnedPositionalEmbedding(nn.Embedding):
@@ -83,34 +99,37 @@ class ConicaLearnedPositionalEmbedding(nn.Embedding):
 
     def __init__(self, max_position: int, d_modal: int):
         super().__init__(max_position, d_modal)
+        self.max_position = max_position
 
-    def forward(self, input_ids_shape: torch.Size, past_key_values_length: int = 0):
+    def forward(self, input_ids: torch.Tensor, past_key_values_length: int = 0):
         """`input_ids_shape` is expected to be [bsz x seqlen]."""
-        bsz, seq_len = input_ids_shape[:2]
+
+        bsz, seq_len = input_ids.shape[:2]
         positions = torch.arange(
-            past_key_values_length, past_key_values_length + seq_len, dtype=torch.long, device=self.weight.device
-        )
+            past_key_values_length, past_key_values_length + seq_len, dtype=torch.long,
+            device=self.weight.device
+        ).unsqueeze(0).repeat(bsz, 1)
         return super().forward(positions)
 
 
 class ConicaVisionEmbedding(nn.Module):
     def __init__(self, config: ConicaConfig):
         super().__init__()
-        self.local_embeds = nn.Linear(config.d_vision_local, config.d_model)
-        self.global_embeds = nn.Linear(config.d_vision_global, config.d_model)
-        self.layer_norm = nn.LayerNorm(config.d_model, config.layer_norm_eps)
+        self.vision_embeds = nn.Linear(config.d_vision,config.d_model)
+        self.vision_act = ACT2FN[config.activation_function]
+        self.vision_norm = nn.LayerNorm(config.d_model,config.ln_eps)
         self.dropout = config.vision_dropout
 
-    def forward(self, g_feats, l_feats):
-        hidden_states = torch.cat((self.global_embeds(g_feats), self.local_embeds(l_feats)), dim=1)
-        hidden_states = self.layer_norm(hidden_states)
+    def forward(self, vision_feats):
+        hidden_states = self.vision_embeds(vision_feats)
+        hidden_states = self.vision_act(hidden_states)
+        hidden_states = self.vision_norm(hidden_states)
         return dropout(hidden_states, p=self.dropout, training=self.training)
 
 
 class ConicaAttention(nn.Module):
     def __init__(self, config: ConicaConfig):
         super().__init__()
-        self.config = config
         d_modal = config.d_model
         self.d_model = config.d_model
         self.n_head = config.n_head
@@ -122,57 +141,119 @@ class ConicaAttention(nn.Module):
         self.k_proj = nn.Linear(d_modal, d_modal)
         self.v_proj = nn.Linear(d_modal, d_modal)
         self.out_proj = nn.Linear(d_modal, d_modal)
+        self.is_decoder = config.is_decoder
 
-    def transpose_for_scores(self, x):
-        B, L, C = x.shape
-        return x.transpose(0, 1).reshape(L, B * self.n_head, -1).transpose(0, 1)
+    def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
+        return tensor.view(bsz, seq_len, self.n_head, self.d_head).transpose(1, 2).contiguous()
 
     def forward(
             self,
-            hidden_states,
-            attention_mask=None,
-            head_mask=None,
-            encoder_hidden_states=None,
-            encoder_attention_mask=None,
-            past_key_value=None,
-            output_attentions=False
+            hidden_states: torch.Tensor,
+            key_value_states: Optional[torch.Tensor] = None,
+            past_key_value: Optional[Tuple[torch.Tensor]] = None,
+            attention_mask: Optional[torch.Tensor] = None,
+            layer_head_mask: Optional[torch.Tensor] = None,
+            output_attentions: bool = False,
     ):
-        B, L, C = hidden_states.shape
-        is_cross_attention = encoder_hidden_states is not None
-        q = self.transpose_for_scores(self.q_proj(hidden_states)) * self.scale
+        is_cross_attention = key_value_states is not None
+        bsz, tgt_len, _ = hidden_states.size()
+        # get query proj
+        query_states = self.q_proj(hidden_states) * self.scale
+        # get key, value proj
         if is_cross_attention and past_key_value is not None:
-            k = past_key_value[0]
-            v = past_key_value[1]
+            # decoder cross_attention
+            # reuse k,v, cross_attentions
+            key_states = past_key_value[0]
+            value_states = past_key_value[1]
         elif is_cross_attention:
-            k = self.transpose_for_scores(self.k_proj(encoder_hidden_states))
-            v = self.transpose_for_scores(self.v_proj(encoder_hidden_states))
-            attention_mask = encoder_attention_mask
+            # decoder cross_attention
+            key_states = self._shape(self.k_proj(key_value_states), -1, bsz)
+            value_states = self._shape(self.v_proj(key_value_states), -1, bsz)
         elif past_key_value is not None:
-            k = self.transpose_for_scores(self.k_proj(hidden_states))
-            v = self.transpose_for_scores(self.v_proj(hidden_states))
-            k = torch.cat([past_key_value[0], k], dim=1)
-            v = torch.cat([past_key_value[1], v], dim=1)
+            # decoder self_attention
+            # reuse k, v,
+            key_states = self._shape(self.k_proj(hidden_states), -1, bsz)
+            value_states = self._shape(self.v_proj(hidden_states), -1, bsz)
+            key_states = torch.cat([past_key_value[0], key_states], dim=2)
+            value_states = torch.cat([past_key_value[1], value_states], dim=2)
         else:
-            k = self.transpose_for_scores(self.k_proj(hidden_states))
-            v = self.transpose_for_scores(self.v_proj(hidden_states))
-        past_key_value = (k, v)
-        attention_scores = torch.bmm(q, k.transpose(-1, -2))
+            # encoder/decoder self_attention
+            key_states = self._shape(self.k_proj(hidden_states), -1, bsz)
+            value_states = self._shape(self.v_proj(hidden_states), -1, bsz)
+
+        if self.is_decoder:
+            # if cross_attention save Tuple(torch.Tensor, torch.Tensor) of all cross attention key/value_states.
+            # Further calls to cross_attention layer can then reuse all cross-attention
+            # key/value_states (first "if" case)
+            # if uni-directional self-attention (decoder) save Tuple(torch.Tensor, torch.Tensor) of
+            # all previous decoder key/value_states. Further calls to uni-directional self-attention
+            # can concat previous decoder key/value_states to current projected key/value_states (third "elif" case)
+            # if encoder bi-directional self-attention `past_key_value` is always `None`
+            past_key_value = (key_states, value_states)
+        proj_shape = (bsz * self.n_head, -1, self.d_head)
+        query_states = self._shape(query_states, tgt_len, bsz).view(*proj_shape)
+        key_states = key_states.view(*proj_shape)
+        value_states = value_states.view(*proj_shape)
+
+        src_len = key_states.size(1)
+        attn_weights = torch.bmm(query_states, key_states.transpose(1, 2))
+
+        if attn_weights.size() != (bsz * self.n_head, tgt_len, src_len):
+            raise ValueError(
+                f"Attention weights should be of size {(bsz * self.n_head, tgt_len, src_len)}, but is {attn_weights.size()}"
+            )
+
         if attention_mask is not None:
-            if attention_mask.dim() == 2:
-                attention_mask = attention_mask.unsqueeze(0)
-            attention_scores = attention_scores + attention_mask
-        attention_probs = softmax(attention_scores, dim=-1)
-        attention_probs = dropout(attention_probs, p=self.dropout, training=self.training)
-        hidden_states = torch.bmm(attention_probs, v)
-        if head_mask is not None:
-            hidden_states = hidden_states.view(B, self.n_head, L, C) * head_mask
-            hidden_states = hidden_states.view(-1, L, C)
-        hidden_states = hidden_states.transpose(0, 1).reshape(L, B, C).transpose(0, 1)
-        hidden_states = self.out_proj(hidden_states)
-        hidden_states = dropout(hidden_states, p=self.dropout, training=self.training)
-        outputs = (hidden_states, attention_probs) if output_attentions else (hidden_states,)
-        outputs = outputs + (past_key_value,)
-        return outputs
+            if attention_mask.dim() == 3:
+                attention_mask = attention_mask.unsqueeze(1)
+            if attention_mask.size() != (bsz, 1, tgt_len, src_len):
+                raise ValueError(
+                    f"Attention mask should be of size {(bsz, 1, tgt_len, src_len)}, but is {attention_mask.size()}"
+                )
+            attn_weights = attn_weights.view(bsz, self.n_head, tgt_len, src_len) + attention_mask
+            attn_weights = attn_weights.view(bsz * self.n_head, tgt_len, src_len)
+
+        attn_weights = softmax(attn_weights, dim=-1)
+
+        if layer_head_mask is not None:
+            if layer_head_mask.size() != (self.n_head,):
+                raise ValueError(
+                    f"Head mask for a single layer should be of size {(self.n_head,)}, but is {layer_head_mask.size()}"
+                )
+            attn_weights = layer_head_mask.view(1, -1, 1, 1) * attn_weights.view(bsz, self.n_head, tgt_len, src_len)
+            attn_weights = attn_weights.view(bsz * self.n_head, tgt_len, src_len)
+
+        if output_attentions:
+            # this operation is a bit awkward, but it's required to
+            # make sure that attn_weights keeps its gradient.
+            # In order to do so, attn_weights have to be reshaped
+            # twice and have to be reused in the following
+            attn_weights_reshaped = attn_weights.view(bsz, self.n_head, tgt_len, src_len)
+            attn_weights = attn_weights_reshaped.view(bsz * self.n_head, tgt_len, src_len)
+        else:
+            attn_weights_reshaped = None
+
+        attn_probs = dropout(attn_weights, p=self.dropout, training=self.training)
+
+        attn_output = torch.bmm(attn_probs, value_states)
+
+        if attn_output.size() != (bsz * self.n_head, tgt_len, self.d_head):
+            raise ValueError(
+                f"`attn_output` should be of size {(bsz, self.n_head, tgt_len, self.d_head)}, but is {attn_output.size()}"
+            )
+
+        attn_output = attn_output.view(bsz, self.n_head, tgt_len, self.d_head)
+        attn_output = attn_output.transpose(1, 2)
+
+        # Use the `embed_dim` from the config (stored in the class) rather than `hidden_state` because `attn_output` can
+        # be partitioned aross GPUs when using tensor-parallelism.
+        attn_output = attn_output.reshape(bsz, tgt_len, self.d_model)
+
+        attn_output = self.out_proj(attn_output)
+
+        attn_output = dropout(attn_output, p=self.dropout, training=self.training)
+
+        return attn_output, attn_weights_reshaped, past_key_value
 
 
 class ConicaFFN(nn.Module):
@@ -194,78 +275,78 @@ class ConicaFFN(nn.Module):
 
 
 class ConicaLayer(nn.Module):
-    def __init__(self, config: ConicaConfig, cross_attention=False):
+    def __init__(self, config: ConicaConfig, droppath=0., cross_attention=False):
         super().__init__()
         self.config = config
         self.self_attn = ConicaAttention(config)
-        self.self_attn_norm = nn.LayerNorm(config.d_model)
+        self.self_attn_norm = nn.LayerNorm(config.d_model, config.ln_eps)
         self.cross_attn = None
         if cross_attention:
             self.cross_attn = ConicaAttention(config)
-            self.cross_attn_norm = nn.LayerNorm(config.d_model)
+            self.cross_attn_norm = nn.LayerNorm(config.d_model, config.ln_eps)
         self.ffn = ConicaFFN(config)
-        self.ffn_norm = nn.LayerNorm(config.d_model)
+        self.ffn_norm = nn.LayerNorm(config.d_model, config.ln_eps)
+        self.droppath = droppath
+        self.pre_norm = config.pre_norm
 
     def forward(
             self,
             hidden_states: torch.Tensor,
             attention_mask: Optional[torch.Tensor] = None,
-            encoder_hidden_states: Optional[torch.Tensor] = None,
-            encoder_attention_mask: Optional[torch.Tensor] = None,
             layer_head_mask: Optional[torch.Tensor] = None,
+            encoder_hidden_states: Optional[torch.Tensor] = None,
             cross_attn_layer_head_mask: Optional[torch.Tensor] = None,
+            encoder_attention_mask: Optional[torch.Tensor] = None,
             past_key_value: Optional[Tuple[torch.Tensor]] = None,
             output_attentions: Optional[bool] = False,
-            use_cache: Optional[bool] = True,
+            use_cache: Optional[bool] = False,
     ):
         self_attn_weights, cross_attn_weights = None, None
         residual = hidden_states
+        if self.pre_norm:
+            hidden_states = self.self_attn_norm(hidden_states)
         # Self Attention
         # decoder uni-directional self-attention cached key/values tuple is at positions 1,2
         self_attn_past_key_value = past_key_value[:2] if past_key_value is not None else None
-        self_attn_outputs = self.self_attn(
-            hidden_states,
-            attention_mask,
-            layer_head_mask,
+        hidden_states, attn_weights, present_key_value = self.self_attn(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            layer_head_mask=layer_head_mask,
             output_attentions=output_attentions,
-            past_key_value=self_attn_past_key_value,
+            past_key_value=self_attn_past_key_value
         )
-        hidden_states = self_attn_outputs[0]
-        hidden_states = droppath(hidden_states, p=self.droppath, training=self.training)
-        hidden_states = self.self_attn_norm(residual + hidden_states)
-        present_key_value = self_attn_outputs[-1]
-        if output_attentions:
-            self_attn_weights = self_attn_outputs[1]
-        if self.cross_attn is not None:
+        hidden_states = droppath(hidden_states, self.droppath, self.training)
+        hidden_states = residual + hidden_states
+        if not self.pre_norm:
+            hidden_states = self.self_attn_norm(hidden_states)
+        if self.cross_attn is not None and encoder_hidden_states is not None:
             residual = hidden_states
+            if self.pre_norm:
+                hidden_states = self.cross_attn_norm(hidden_states)
             cross_attn_past_key_value = past_key_value[-2:] if past_key_value is not None else None
-            if encoder_hidden_states is None:
-                raise ValueError("encoder_hidden_states must be given for cross-attention layers")
-            cross_attn_outputs = self.cross_attn(
-                hidden_states,
-                attention_mask,
-                layer_head_mask,
-                encoder_hidden_states,
-                encoder_attention_mask,
-                output_attentions=output_attentions,
+            hidden_states, cross_attn_weights, cross_attn_present_key_value = self.cross_attn(
+                hidden_states=hidden_states,
+                key_value_states=encoder_hidden_states,
+                attention_mask=encoder_attention_mask,
+                layer_head_mask=cross_attn_layer_head_mask,
                 past_key_value=cross_attn_past_key_value,
+                output_attentions=output_attentions,
             )
-            hidden_states = cross_attn_outputs[0]
-            cross_present_key_value = cross_attn_outputs[-1]
+            hidden_states = droppath(hidden_states, self.droppath, self.training)
+            hidden_states = residual + hidden_states
+            if not self.pre_norm:
+                hidden_states = self.cross_attn_norm(hidden_states)
+            present_key_value = present_key_value + cross_attn_present_key_value
 
-            hidden_states = droppath(hidden_states, p=self.droppath, training=self.training)
-            hidden_states = self.cross_attn_norm(residual + hidden_states)
-
-            present_key_value = present_key_value + cross_present_key_value
-
-            if output_attentions:
-                cross_attn_weights = cross_attn_outputs[1]
             # add cross-attn to positions 3,4 of present_key_value tuple
         residual = hidden_states
+        if self.pre_norm:
+            hidden_states = self.ffn_norm(hidden_states)
         hidden_states = self.ffn(hidden_states)
-        hidden_states = droppath(hidden_states, p=self.droppath, training=self.training)
-        hidden_states = self.ffn_norm(residual + hidden_states)
-
+        hidden_states = droppath(hidden_states, self.droppath, self.training)
+        hidden_states = residual + hidden_states
+        if not self.pre_norm:
+            hidden_states = self.ffn_norm(hidden_states)
         outputs = (hidden_states,)
         if output_attentions:
             outputs += (self_attn_weights, cross_attn_weights)
@@ -277,11 +358,15 @@ class ConicaLayer(nn.Module):
 class ConicaPreTrainedModel(PreTrainedModel):
     config_class = ConicaConfig
     base_model_prefix = "conica"
+    main_input_name = "vision_feats"
     supports_gradient_checkpointing = True
     _keys_to_ignore_on_load_unexpected = None
 
     def _init_weights(self, module):
         std = self.config.init_std
+        # d_model = self.config.d_model
+        # attn_std = (d_model ** -0.5)
+        # ffn_std = (2 * d_model) ** -0.5
         if isinstance(module, nn.Linear):
             module.weight.data.normal_(mean=0.0, std=std)
             if module.bias is not None:
@@ -294,29 +379,27 @@ class ConicaPreTrainedModel(PreTrainedModel):
             module.bias.data.zero_()
             module.weight.data.fill_(1.0)
 
+    def _set_gradient_checkpointing(self, module, value=False):
+        if isinstance(module, (ConicaVisionEncoder, ConicaTextDecoder)):
+            module.gradient_checkpointing = value
 
-class ConicaUnimodalVisionEncoder(ConicaPreTrainedModel):
+
+class ConicaVisionEncoder(ConicaPreTrainedModel):
     def __init__(self, config: ConicaConfig):
         super().__init__(config)
         self.embed_vision = ConicaVisionEmbedding(config)
-        self.layers = nn.ModuleList([ConicaLayer(config, False) for _ in range(config.vision_encoder_layers)])
-        self.gradient_checkpointing = False
         self.global_pool = config.vision_global_pool
+        dpr = [x.item() for x in
+               torch.linspace(0, config.droppath, config.vision_encoder_layers)]  # stochastic depth decay rule
+        self.layers = nn.ModuleList([ConicaLayer(config, dpr[i], False) for i in range(config.vision_encoder_layers)])
+        self.gradient_checkpointing = False
         self.vision_proj = nn.Linear(config.d_model, config.d_align)
+        self.final_norm = nn.LayerNorm(config.d_model, config.ln_eps) if config.pre_norm else nn.Identity()
         self.post_init()
-
-    def _expand_mask(self, attention_mask):
-        bsz, src_len = attention_mask.size()
-        attn_mask = attention_mask.view(bsz, 1, 1, src_len). \
-            expand(-1, self.config.n_head, -1, -1).reshape(bsz * self.config.n_head, 1, src_len)
-        inverted_mask = 1.0 - attn_mask
-        attn_mask = inverted_mask.masked_fill(inverted_mask > 0, float('-inf'))
-        return attn_mask
 
     def forward(
             self,
-            cls_feats=None,
-            local_feats=None,
+            vision_feats=None,
             attention_mask=None,
             head_mask=None,
             output_attentions=None,
@@ -329,20 +412,19 @@ class ConicaUnimodalVisionEncoder(ConicaPreTrainedModel):
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         # expand attention_mask
-        if attention_mask is not None:
-            # [bsz, seq_len] -> [bsz*num_heads, tgt_seq_len, src_seq_len]
-            attention_mask = self._expand_mask(attention_mask, local_feats.dtype)
+
         all_hidden_states = () if output_hidden_states else None
         all_attentions = () if output_attentions else None
         # check if head_mask has a correct number of layers specified if desired\
 
-        hidden_states = self.embed_visual(cls_feats, local_feats)
-        if head_mask is not None:
-            if head_mask.size()[0] != (len(self.layers)):
-                raise ValueError(
-                    f"The head_mask should be specified for {len(self.layers)} layers, but it is for {head_mask.size()[0]}."
-                )
-        for idx, encoder_layer in enumerate(self.layers):
+        hidden_states = self.embed_vision(vision_feats)
+
+        if attention_mask is not None:
+            # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
+            expanded_attention_mask = _expand_mask(attention_mask, vision_feats.dtype)
+        else:
+            expanded_attention_mask = None
+        for idx, layer in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
 
@@ -354,87 +436,100 @@ class ConicaUnimodalVisionEncoder(ConicaPreTrainedModel):
                     return custom_forward
 
                 layer_outputs = torch.utils.checkpoint.checkpoint(
-                    create_custom_forward(encoder_layer),
+                    create_custom_forward(layer),
                     hidden_states,
-                    attention_mask,
-                    (head_mask[idx] if head_mask is not None else None),
+                    expanded_attention_mask,
+                    (head_mask[idx] if head_mask is not None else None)
                 )
             else:
-                layer_outputs = encoder_layer(
-                    hidden_states,
-                    attention_mask,
+                layer_outputs = layer(
+                    hidden_states=hidden_states,
+                    attention_mask=expanded_attention_mask,
                     layer_head_mask=(head_mask[idx] if head_mask is not None else None),
                     output_attentions=output_attentions,
+                    past_key_value=None,
+                    use_cache=False,
                 )
-
             hidden_states = layer_outputs[0]
             if output_attentions:
                 all_attentions = all_attentions + (layer_outputs[1],)
         if output_hidden_states:
             all_hidden_states = all_hidden_states + (hidden_states,)
+        hidden_states = self.final_norm(hidden_states)
         if self.global_pool:
-            global_outputs, local_outputs = self.vision_proj(hidden_states.mean(1)), hidden_states
+            pooler_output = self.vision_proj((hidden_states * attention_mask.unsqueeze(-1)).sum(1)
+                                             / attention_mask.sum(-1).unsqueeze(-1))
         else:
-            global_outputs, local_outputs = self.vision_proj(hidden_states[:, 0, :]), hidden_states[:, 1:, :]
-
+            pooler_output = self.vision_proj(hidden_states[:, 0, :])
+        pooler_output = normalize(pooler_output, dim=-1)
         if not return_dict:
-            return tuple(v for v in [global_outputs, local_outputs, hidden_states, all_hidden_states, all_attentions] if
-                         v is not None)
-
-        return ConicaForUnimocalVisionOutput(
-            unimodal_vision_global_outputs=global_outputs,
-            unimodal_vision_local_outputs=local_outputs,
+            return tuple(v for v in [hidden_states, all_hidden_states, all_attentions, pooler_output])
+        return BaseModelOutputWithPooling(
             last_hidden_state=hidden_states,
             hidden_states=all_hidden_states,
-            attentions=all_attentions
+            attentions=all_attentions,
+            pooler_output=pooler_output
         )
 
 
-class ConicaUnimodalTextEncoder(ConicaPreTrainedModel):
+class ConicaTextDecoder(ConicaPreTrainedModel):
     def __init__(self, config: ConicaConfig):
         super().__init__(config)
-        self.embed_token = nn.Embedding(config.vocab_size, config.d_model)
-        self.cls_embedding = nn.Parameter(config.init_std * torch.randn(config.d_model))
-        self.pos_embedding = ConicaLearnedPositionalEmbedding(config.max_positions, config.d_model)
-        self.layers = nn.ModuleList([ConicaLayer(config, False) for _ in range(config.vision_encoder_layers)])
+        self.embed_token = nn.Embedding(config.vocab_size, config.d_model, config.pad_token_id)
+        self.embed_scale = config.d_model ** 0.5 if config.position_type == "sinusoid" else 1
+        self.embed_positions = SinusoidEncoding(config.max_positions,
+                                                config.d_model) if config.position_type == "sinusoid" else \
+            ConicaLearnedPositionalEmbedding(config.max_positions + 1, config.d_model)
+
+        dpr_1 = [x.item() for x in
+                 torch.linspace(0, config.droppath, config.text_encoder_layers)]  # stochastic depth decay rule
+        dpr_2 = [x.item() for x in
+                 torch.linspace(0, config.droppath, config.text_encoder_layers)]  # stochastic depth decay rule
+
+        self.layers = nn.ModuleList([ConicaLayer(config, dpr_1[i], False) for i in range(config.text_encoder_layers)] +
+                                    [ConicaLayer(config, dpr_2[i], True) for i in
+                                     range(config.multimodal_decoder_layers)])
         self.text_proj = nn.Linear(config.d_model, config.d_align)
+        self.text_norm = nn.LayerNorm(config.d_model, config.ln_eps) if config.pre_norm else nn.Identity()
+        self.dropout = config.dropout
+        self.gradient_checkpointing = False
+        self.final_norm = nn.LayerNorm(config.d_model, config.ln_eps) if config.pre_norm else nn.Identity()
         self.post_init()
 
-    def generate_decoder_attn_mask(self, attn_mask=None, add_cls=False, tgt_len=None, device="cpu"):
-        if attn_mask is None and tgt_len is None:
-            raise ValueError("You have to specify either attn_mask or tgt_len")
-        if attn_mask is not None:
-            if add_cls:
-                attn_mask = pad(attn_mask, (1, 0), value=1.)
-            bsz, src_len = attn_mask.size()
-            attn_mask = attn_mask.view(bsz, 1, 1, src_len). \
-                expand(-1, self.config.n_head, -1, -1).reshape(bsz * self.config.n_head, 1, src_len)
-            inverted_mask = 1.0 - attn_mask
-            attn_mask = inverted_mask.masked_fill(inverted_mask > 0, float('-inf'))
-        else:
-            if add_cls:
-                tgt_len += 1
-            src_len = tgt_len
-        if tgt_len is None:
-            tgt_len = src_len
-        causal_mask = torch.triu(torch.full((tgt_len, src_len), float('-inf')), diagonal=1).to(device)
-        if add_cls:
-            causal_mask[..., 0, :] = 0
-            causal_mask[..., 1:, 0] = float('-inf')
-        causal_mask = causal_mask.unsqueeze(0)
-        return attn_mask + causal_mask if attn_mask is not None else causal_mask
+    def _prepare_decoder_attention_mask(self, attention_mask, input_shape, inputs_embeds, past_key_values_length):
+        # create causal mask
+        # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
+        combined_attention_mask = None
+        if input_shape[-1] > 1:
+            combined_attention_mask = _make_causal_mask(
+                input_shape, inputs_embeds.dtype, past_key_values_length=past_key_values_length
+            ).to(self.device)
+
+        if attention_mask is not None:
+            # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
+
+            expanded_attn_mask = _expand_mask(attention_mask, inputs_embeds.dtype, tgt_len=input_shape[-1])
+            combined_attention_mask = (
+                expanded_attn_mask if combined_attention_mask is None else expanded_attn_mask + combined_attention_mask
+            )
+
+        return combined_attention_mask
 
     def forward(
             self,
             input_ids=None,
             attention_mask=None,
+            encoder_hidden_states=None,
+            encoder_attention_mask=None,
             head_mask=None,
+            cross_attn_head_mask=None,
             past_key_values=None,
             inputs_embeds=None,
             use_cache=None,
             output_attentions=None,
             output_hidden_states=None,
             return_dict=None,
+            return_unimodal_feature_only: bool = False
     ):
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -444,20 +539,487 @@ class ConicaUnimodalTextEncoder(ConicaPreTrainedModel):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         # retrieve input_ids and inputs_embeds
-        if input_ids is not None and inputs_embeds is not None:
-            raise ValueError("You cannot specify both decoder_input_ids and decoder_inputs_embeds at the same time")
-        elif input_ids is not None:
-            input_shape = input_ids.size()
-            input_ids = input_ids.view(-1, input_shape[-1])
-
-        elif inputs_embeds is not None:
-            input_shape = inputs_embeds.size()[:-1]
-        else:
-            raise ValueError("You have to specify either decoder_input_ids or decoder_inputs_embeds")
+        if input_ids is None:
+            raise ValueError("You have to specify decoder_input_ids and decoder_inputs_embeds at the same time")
+        input_shape = input_ids.size()
+        input_ids = input_ids.view(-1, input_shape[-1])
 
         past_key_values_length = past_key_values[0][0].shape[2] if past_key_values is not None else 0
 
         if inputs_embeds is None:
-            inputs_embeds = self.embed_token(input_ids)
-            inputs_embeds = torch.cat(
-                (self.cls_emb.reshape(1, 1, -1).repeat(inputs_embeds.size(0), 1, 1)), dim=1)
+            inputs_embeds = self.embed_token(input_ids) * self.embed_scale
+        if encoder_attention_mask is not None:
+            # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
+            encoder_attention_mask = _expand_mask(encoder_attention_mask, inputs_embeds.dtype, tgt_len=input_shape[-1])
+        attention_mask = self._prepare_decoder_attention_mask(
+            attention_mask, input_shape, inputs_embeds, past_key_values_length
+        )
+        positions = self.embed_positions(input_ids, past_key_values_length)
+
+        hidden_states = inputs_embeds + positions
+        hidden_states = dropout(hidden_states, p=self.dropout, training=self.training)
+        all_hidden_states = () if output_hidden_states else None
+        all_self_attns = () if output_attentions else None
+        all_cross_attentions = () if (output_attentions and encoder_hidden_states is not None) else None
+        next_decoder_cache = () if use_cache else None
+        pooler_output = None
+        # check if head_mask/cross_attn_head_mask has a correct number of layers specified if desired
+        for idx, layer in enumerate(self.layers):
+
+            if output_hidden_states:
+                all_hidden_states += (hidden_states,)
+
+            past_key_value = past_key_values[idx] if past_key_values is not None else None
+
+            if self.gradient_checkpointing and self.training:
+
+                if use_cache:
+                    logger.warning(
+                        "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`..."
+                    )
+                    use_cache = False
+
+                def create_custom_forward(module):
+                    def custom_forward(*inputs):
+                        # None for past_key_value
+                        return module(*inputs, output_attentions, use_cache)
+
+                    return custom_forward
+
+                layer_outputs = torch.utils.checkpoint.checkpoint(
+                    create_custom_forward(layer),
+                    hidden_states,
+                    attention_mask,
+                    head_mask[idx] if head_mask is not None else None,
+                    encoder_hidden_states,
+                    cross_attn_head_mask[idx] if cross_attn_head_mask else None,
+                    encoder_attention_mask,
+                    None,
+                )
+            else:
+                layer_outputs = layer(
+                    hidden_states,
+                    attention_mask=attention_mask,
+                    encoder_hidden_states=encoder_hidden_states,
+                    encoder_attention_mask=encoder_attention_mask,
+                    layer_head_mask=(head_mask[idx] if head_mask is not None else None),
+                    cross_attn_layer_head_mask=(
+                        cross_attn_head_mask[idx] if cross_attn_head_mask is not None else None
+                    ),
+                    past_key_value=past_key_value,
+                    output_attentions=output_attentions,
+                    use_cache=use_cache,
+                )
+            hidden_states = layer_outputs[0]
+
+            if use_cache:
+                next_decoder_cache += (layer_outputs[3 if output_attentions else 1],)
+
+            if output_attentions:
+                all_self_attns += (layer_outputs[1],)
+                if encoder_hidden_states is not None:
+                    all_cross_attentions += (layer_outputs[2],)
+            if idx == self.config.text_encoder_layers - 1:
+                pooler_output = self.text_proj(
+                    self.text_norm(hidden_states[torch.arange(input_ids.size(0)), torch.argmax(input_ids, dim=1)]))
+                pooler_output = normalize(pooler_output, dim=-1)
+                if return_unimodal_feature_only:
+                    break
+        # add hidden states from the last decoder layer
+        hidden_states = self.final_norm(hidden_states)
+        if output_hidden_states:
+            all_hidden_states += (hidden_states,)
+        next_cache = next_decoder_cache if use_cache else None
+        if not return_dict:
+            return tuple(
+                v
+                for v in
+                [hidden_states, next_cache, all_hidden_states, all_self_attns, all_cross_attentions, pooler_output]
+            )
+        return BaseModelOutputWithPoolingAndCrossAttentions(
+            last_hidden_state=hidden_states,
+            past_key_values=next_cache,
+            hidden_states=all_hidden_states,
+            attentions=all_self_attns,
+            cross_attentions=all_cross_attentions,
+            pooler_output=pooler_output
+        )
+
+
+class CONICAModel(ConicaPreTrainedModel):
+    def __init__(self, config: ConicaConfig):
+        super().__init__(config)
+        encoder_config = copy.deepcopy(config)
+        encoder_config.is_decoder = False
+        encoder_config.use_cache = False
+        encoder_config.is_encoder_decoder = False
+        self.encoder = ConicaVisionEncoder(encoder_config)
+        decoder_config = copy.deepcopy(config)
+        decoder_config.is_decoder = True
+        decoder_config.is_encoder_decoder = False
+        self.decoder = ConicaTextDecoder(decoder_config)
+        self.post_init()
+
+    def get_encoder(self):
+        return self.encoder
+
+    def get_decoder(self):
+        return self.decoder
+
+    def get_input_embeddings(self):
+        return self.decoder.embed_token
+
+    def set_input_embeddings(self, new_embeddings):
+        self.decoder.embed_tokens = new_embeddings
+
+    def forward(
+            self,
+            vision_feats,
+            attention_mask=None,
+            decoder_input_ids=None,
+            decoder_attention_mask=None,
+            head_mask=None,
+            decoder_head_mask=None,
+            cross_attn_head_mask=None,
+            encoder_outputs=None,
+            past_key_values=None,
+            decoder_inputs_embeds=None,
+            use_cache=None,
+            output_attentions=None,
+            output_hidden_states=None,
+            return_dict=None,
+            return_unimodal_feature_only=False
+    ):
+        if decoder_input_ids is None and decoder_inputs_embeds is None:
+            raise ValueError(
+                "`decoder_input_ids` and `decoder_inputs_embeds` "
+                "can not be None at the same time "
+            )
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        use_cache = use_cache if use_cache is not None else self.config.use_cache
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        expand_size = 1
+        if encoder_outputs is None:
+            #
+            if decoder_input_ids is None:
+                expand_size = decoder_inputs_embeds.size(0) // vision_feats.size(0)
+            elif decoder_inputs_embeds is None:
+                expand_size = decoder_input_ids.size(0) // vision_feats.size(0)
+            encoder_outputs = self.encoder(
+                vision_feats,
+                attention_mask=attention_mask,
+                head_mask=head_mask,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+            )
+
+            expanded_return_idx = torch.arange(vision_feats.shape[0]).view(-1, 1).repeat(1, expand_size).view(-1).to(
+                vision_feats.device)
+        elif return_dict and not isinstance(encoder_outputs, BaseModelOutputWithPooling):
+            encoder_outputs = BaseModelOutputWithPooling(
+                last_hidden_state=encoder_outputs[0],
+                hidden_states=encoder_outputs[1] if len(encoder_outputs) > 1 else None,
+                attentions=encoder_outputs[2] if len(encoder_outputs) > 2 else None,
+                pooler_output=encoder_outputs[3] if len(encoder_outputs) > 3 else None,
+            )
+
+        encoder_hidden_states = encoder_outputs[0].index_select(0, expanded_return_idx.to(
+            encoder_outputs.last_hidden_state.device)) if expand_size > 1 else encoder_outputs[0]
+        if attention_mask is not None:
+            attention_mask = attention_mask.index_select(0, expanded_return_idx.to(
+                encoder_outputs.last_hidden_state.device)) if expand_size > 1 else attention_mask
+        if not self.config.vision_global_pool and self.training:
+            encoder_hidden_states = encoder_hidden_states[:, 1:]
+            if attention_mask is not None:
+                attention_mask = attention_mask[:, 1:]
+        decoder_outputs = self.decoder(
+            input_ids=decoder_input_ids,
+            attention_mask=decoder_attention_mask,
+            encoder_hidden_states=encoder_hidden_states,
+            encoder_attention_mask=attention_mask if attention_mask is not None else None,
+            head_mask=decoder_head_mask,
+            cross_attn_head_mask=cross_attn_head_mask,
+            past_key_values=past_key_values,
+            inputs_embeds=decoder_inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            return_unimodal_feature_only=return_unimodal_feature_only
+        )
+        if not return_dict:
+            return decoder_outputs + encoder_outputs
+
+        return Seq2SeqModelOutputWithPooling(
+            last_hidden_state=decoder_outputs.last_hidden_state,
+            past_key_values=decoder_outputs.past_key_values,
+            decoder_hidden_states=decoder_outputs.hidden_states,
+            decoder_attentions=decoder_outputs.attentions,
+            cross_attentions=decoder_outputs.cross_attentions,
+            encoder_last_hidden_state=encoder_outputs.last_hidden_state,
+            encoder_hidden_states=encoder_outputs.hidden_states,
+            encoder_attentions=encoder_outputs.attentions,
+            pooler_output=(encoder_outputs.pooler_output, decoder_outputs.pooler_output)
+        )
+
+
+class ConicaModelWithLMHead(ConicaPreTrainedModel, ConicaGeneration):
+    def __init__(self, config: ConicaConfig):
+        super().__init__(config)
+        self.model = CONICAModel(config)
+        self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
+        self.tau = nn.Parameter(torch.ones([]) * config.tau)
+        self.post_init()
+        config_momentum = copy.deepcopy(config)
+        config_momentum.multimodal_decoder_layers = 0
+        self.model_m = CONICAModel(config_momentum)
+
+        self.copy_params()
+
+        self.register_buffer("v_queue", torch.randn(config.queue_size, config.d_align))
+        self.register_buffer("t_queue", torch.randn(config.queue_size * config.seq_per_img, config.d_align))
+
+        self.v_queue = nn.functional.normalize(self.v_queue, dim=1)
+        self.t_queue = nn.functional.normalize(self.t_queue, dim=1)
+        self.dropout = config.lm_dropout
+
+    def get_encoder(self):
+        return self.model.get_encoder()
+
+    def get_decoder(self):
+        return self.model.get_decoder()
+
+    def get_input_embeddings(self):
+        return self.model.get_input_embeddings()
+
+    def set_input_embeddings(self, new_embeddings):
+        self.model.set_input_embeddings(new_embeddings)
+
+    def get_output_embeddings(self):
+        return self.lm_head
+
+    def set_output_embeddings(self, new_embeddings):
+        self.lm_head = new_embeddings
+
+    def copy_params(self):
+        for name_m, parameter_m in self.model_m.named_parameters():
+            parameter_m.data.copy_(self.model.state_dict()[name_m].data)
+            parameter_m.requires_grad = False
+
+    @torch.no_grad()
+    def _momentum_update(self):
+        for name_m, parameter_m in self.model_m.named_parameters():
+            parameter = self.model.state_dict()[name_m]
+            parameter_m.data = parameter_m.data * self.config.momentum + parameter.data * (1 - self.config.momentum)
+
+    @staticmethod
+    @torch.no_grad()
+    def concat_all_gather(tensor):
+        local_rank = int(os.environ.get("LOCAL_RANK", -1))
+        if local_rank == -1:
+            return tensor
+        tensors_gather = [torch.ones_like(tensor) for _ in range(get_world_size())]
+        all_gather(tensors_gather, tensor, async_op=False)
+        return torch.cat(tensors_gather, dim=0)
+
+    @torch.no_grad()
+    def _dequeue_and_enqueue(self, v_embeds, t_embeds):
+        v_embeds = self.concat_all_gather(v_embeds)
+        t_embeds = self.concat_all_gather(t_embeds)
+
+        v_embeds = torch.cat((v_embeds, self.v_queue.clone().detach()), dim=0)
+        t_embeds = torch.cat((t_embeds, self.t_queue.clone().detach()), dim=0)
+        self.v_queue = v_embeds[:len(self.v_queue)]
+        self.t_queue = t_embeds[:len(self.t_queue)]
+
+    def prepare_inputs_for_generation(
+            self,
+            input_ids,
+            vision_feats=None,
+            past_key_values=None,
+            attention_mask=None,
+            head_mask=None,
+            decoder_attention_mask=None,
+            decoder_head_mask=None,
+            cross_attn_head_mask=None,
+            use_cache=None,
+            encoder_outputs=None,
+            **kwargs
+    ):
+        if past_key_values is not None:
+            input_ids = input_ids[:, -1:]
+        return {
+            "vision_feats": None,
+            "encoder_outputs": encoder_outputs,
+            "past_key_values": past_key_values,
+            "decoder_input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "head_mask": head_mask,
+            "decoder_head_mask": decoder_head_mask,
+            "cross_attn_head_mask": cross_attn_head_mask,
+            "decoder_attention_mask": None,
+            "use_cache": use_cache,
+        }
+
+    def forward(self, *args, **kwargs):
+        is_generate = kwargs.get('is_generate', False)
+        if is_generate:
+            kwargs.pop("is_generate")
+            return super().generate.__wrapped__(self, *args, **kwargs)
+        else:
+            return self._forward(*args, **kwargs)
+
+    def init_tau(self):
+        nn.init.constant_(self.tau.data,self.config.tau)
+
+    def _forward(
+            self,
+            vision_feats=None,
+            attention_mask=None,
+            decoder_input_ids=None,
+            decoder_attention_mask=None,
+            head_mask=None,
+            decoder_head_mask=None,
+            cross_attn_head_mask=None,
+            encoder_outputs=None,
+            past_key_values=None,
+            decoder_inputs_embeds=None,
+            labels=None,
+            use_cache=None,
+            output_attentions=None,
+            output_hidden_states=None,
+            return_dict=None,
+            return_unimodal_feature_only=False
+    ):
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        if labels is not None:
+            if use_cache:
+                logger.warning("The `use_cache` argument is changed to `False` since `labels` is provided.")
+            use_cache = False
+            if decoder_input_ids is None and decoder_inputs_embeds is None:
+                decoder_input_ids = labels
+        outputs = self.model(
+            vision_feats=vision_feats,
+            attention_mask=attention_mask,
+            decoder_input_ids=decoder_input_ids,
+            decoder_attention_mask=decoder_attention_mask,
+            head_mask=head_mask,
+            decoder_head_mask=decoder_head_mask,
+            cross_attn_head_mask=cross_attn_head_mask,
+            encoder_outputs=encoder_outputs,
+            past_key_values=past_key_values,
+            decoder_inputs_embeds=decoder_inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            return_unimodal_feature_only=return_unimodal_feature_only
+        )
+        loss = None
+        lm_logits = None
+
+        if not return_unimodal_feature_only:
+            lm_logits = self.lm_head(
+                dropout(outputs.last_hidden_state, self.dropout, self.training)
+            )
+        v_embeds, t_embeds = outputs.pooler_output[0], outputs.pooler_output[1]
+        if labels is not None:
+            with torch.no_grad():
+                self.tau.clamp_(min=0.01, max=0.5)
+                self._momentum_update()
+                outputs_m = self.model_m(
+                    vision_feats=vision_feats,
+                    attention_mask=attention_mask,
+                    decoder_input_ids=decoder_input_ids,
+                    decoder_attention_mask=decoder_attention_mask,
+                    head_mask=head_mask,
+                    decoder_head_mask=decoder_head_mask,
+                    cross_attn_head_mask=cross_attn_head_mask,
+                    encoder_outputs=encoder_outputs,
+                    past_key_values=past_key_values,
+                    decoder_inputs_embeds=decoder_inputs_embeds,
+                    use_cache=use_cache,
+                    output_attentions=output_attentions,
+                    output_hidden_states=output_hidden_states,
+                    return_dict=return_dict,
+                    return_unimodal_feature_only=True
+                )
+                v_embeds_m, t_embeds_m = outputs_m.pooler_output[0], outputs_m.pooler_output[1]
+                v_embeds_all = torch.cat([v_embeds_m, self.v_queue.clone().detach()], dim=0)
+                t_embeds_all = torch.cat([t_embeds_m, self.t_queue.clone().detach()], dim=0)
+                expand_size = 1
+                if decoder_input_ids is None:
+                    expand_size = decoder_inputs_embeds.size(0) // vision_feats.size(0)
+                elif decoder_inputs_embeds is None:
+                    expand_size = decoder_input_ids.size(0) // vision_feats.size(0)
+
+            sim_i2t = torch.div(torch.matmul(v_embeds, t_embeds_all.t()), self.tau)
+            sim_t2i = torch.div(torch.matmul(t_embeds, v_embeds_all.t()), self.tau)
+            sim_i2t_target = torch.zeros_like(sim_i2t, device=sim_i2t.device)
+            sim_t2i_target = torch.zeros_like(sim_t2i, device=sim_t2i.device)
+            for i in range(len(sim_i2t)):
+                sim_i2t_target[i, i * expand_size:(i + 1) * expand_size] = 1 / expand_size
+                sim_t2i_target[i * expand_size:(i + 1) * expand_size, i] = 1
+            co_loss = (cross_entropy(sim_i2t, sim_i2t_target, label_smoothing=self.model.config.label_smoothing) +
+                       cross_entropy(sim_t2i, sim_t2i_target, label_smoothing=self.model.config.label_smoothing)) / 2 * self.config.co_weight
+            self._dequeue_and_enqueue(v_embeds_m, t_embeds_m)
+            loss = co_loss
+            shift_logits = lm_logits[:, :-1, :].contiguous()
+            shift_labels = labels[:, 1:].contiguous()
+            lm_loss = cross_entropy(shift_logits.view(-1, self.config.vocab_size),
+                                    shift_labels.view(-1),
+                                    ignore_index=self.config.pad_token_id,
+                                    label_smoothing=self.model.config.label_smoothing) * self.config.xe_weight
+            loss += lm_loss
+
+        if not return_dict:
+            output = (loss,) + outputs[1:]
+            return ((loss,) + output) if loss is not None else output
+        return Seq2SeqLMOutputWithPooling(
+            loss=loss,
+            logits=lm_logits,
+            past_key_values=outputs.past_key_values,
+            decoder_hidden_states=outputs.decoder_hidden_states,
+            decoder_attentions=outputs.decoder_attentions,
+            cross_attentions=outputs.cross_attentions,
+            encoder_last_hidden_state=outputs.encoder_last_hidden_state,
+            encoder_hidden_states=outputs.encoder_hidden_states,
+            encoder_attentions=outputs.encoder_attentions,
+            pooler_output=(v_embeds, t_embeds)
+        )
+
+    @staticmethod
+    def _reorder_cache(past, beam_idx):
+        reordered_past = ()
+
+        for layer_past in past:
+            # cached cross_attention states don't have to be reordered -> they are always the same
+            reordered_past += (
+                tuple(past_state.index_select(0, beam_idx) for past_state in layer_past[:2]) + layer_past[2:],
+            )
+        return reordered_past
+
+    @staticmethod
+    def expand_cache(past, next_indices, batch_size, num_beams):
+        next_indices = next_indices + torch.arange(0, batch_size, device=next_indices.device).unsqueeze(1) * num_beams
+        next_indices = next_indices.view(-1)
+        # return past
+        new_past = []
+        if past is None:
+            return None
+        for layer in past:
+            items = []
+            for item in layer:
+                item = item.index_select(0, next_indices)
+                items.append(item)
+            new_past.append(items)
+
+        return new_past

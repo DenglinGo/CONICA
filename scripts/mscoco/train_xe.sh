@@ -1,0 +1,23 @@
+python train.py \
+--config_name conica-clip_rn \
+--max_features_len 49 \
+--feature_path /dataset/caption/mscoco/features/RN50x4 \
+--output_dir output/clip-RN50x4/xe/checkpoints \
+--do_train \
+--evaluation_strategy epoch \
+--logging_strategy steps \
+--logging_steps 100 \
+--logging_dir output/clip-RN50x4/xe/logs \
+--save_strategy epoch \
+--per_device_train_batch_size 64 \
+--per_device_eval_batch_size 32 \
+--gradient_accumulation_steps 1 \
+--learning_rate 1e-4 \
+--weight_decay 1e-2 \
+--num_train_epochs 30 \
+--lr_scheduler_type linear \
+--warmup_ratio 0.1 \
+--fp16 \
+--gradient_checkpointing \
+--dataloader_pin_memory false \
+--dataloader_num_workers 8

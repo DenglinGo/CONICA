@@ -5,7 +5,7 @@
 import copy
 
 import torch
-from transformers.generation_beam_search import BeamScorer
+from transformers.generation.beam_search import BeamScorer
 from typing import List, Optional, Tuple
 import warnings
 from collections import UserDict
@@ -40,7 +40,8 @@ class ContrastiveBeamHypotheses:
             score = self.alpha * math.exp(sum_logprobs / (hyp.shape[-1] ** self.length_penalty)) +\
                     (1 - self.alpha) * similarity.item()
         else:
-            score = sum_logprobs / (hyp.shape[-1] ** self.length_penalty)
+            score = sum_logprobs / (logprobs.shape[-1] ** self.length_penalty)
+
         if len(self) < self.num_beams or score > self.worst_score:
             self.beams.append((score, hyp, beam_indices, similarity, logprobs))
             if len(self) > self.num_beams:
@@ -63,7 +64,7 @@ class ContrastiveBeamHypotheses:
         else:
             cur_score = best_sum_logprobs / cur_len ** self.length_penalty
             if self.worst_score > 0:
-                cur_score = math.exp(cur_score) + 1
+                cur_score = self.alpha*math.exp(cur_score) + 1-self.alpha
             ret = self.worst_score >= cur_score
             return ret
 
@@ -219,6 +220,7 @@ class ContrastiveBeamSearchScorer(BeamScorer):
                 )
 
             # Check if we are done so that we can save a pad step if all(done)
+            cur_len += 1  # add up to the length which the next_scores is calculated on
             self._done[batch_idx] = self._done[batch_idx] or beam_hyp.is_done(
                 next_scores[batch_idx].max().item(), cur_len
             )
@@ -274,10 +276,27 @@ class ContrastiveBeamSearchScorer(BeamScorer):
         best_similarities = []
         best_logprobs = []
         best_scores = torch.zeros(batch_size * self.num_beam_hyps_to_keep, device=self.device, dtype=torch.float32)
-
         # retrieve best hypotheses
         for i, beam_hyp in enumerate(self._beam_hyps):
             sorted_hyps = sorted(beam_hyp.beams, key=lambda x: x[0])
+            # probability_0 = 0
+            # for k in range(len(sorted_hyps)):
+            #     item = sorted_hyps[-(1+k)]
+            #     score = item[0]
+            #     similarity = item[3].item()
+            #     probability = score*2-similarity
+            #     if k == 0:
+            #         probability_0 = probability
+            #     else:
+            #         if probability>probability_0:
+            #             for l in range(len(sorted_hyps)):
+            #                 item = sorted_hyps[-(1 + l)]
+            #                 score = item[0]
+            #                 similarity = item[3].item()
+            #                 probability = score * 2 - similarity
+            #
+            #                 print(l,score,similarity,probability,item[1])
+            #             break
             for j in range(self.num_beam_hyps_to_keep):
                 best_hyp_tuple = sorted_hyps.pop()
                 best_score = best_hyp_tuple[0]

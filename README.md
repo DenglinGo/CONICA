@@ -20,7 +20,7 @@ python prepare/prepro_feats.py -model_name ViT-L/14@336px -input_resolution 336 
 ``` 
 python prepare/prepro_datasets.py -karpathy_split_json “your path to karpathy split” -output_file /dataset/mscoco.csv
 ``` 
-You can donwload karpathy split json from: [this link](https://cs.stanford.edu.people/karpathy/deepimagesent/caption_datasets.zip)
+You can donwload karpathy split json from: [this link](http://cs.stanford.edu/people/karpathy/deepimagesent/caption_datasets.zip)
 
 ### HFConfiguration & Tokenizers 
 ``` 

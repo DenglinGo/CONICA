@@ -17,6 +17,7 @@ from utils.cider import Cider
 from utils.bleu import Bleu
 from utils.rouge import Rouge
 from utils.meteor import Meteor
+from utils.spice import Spice
 
 
 class ConicaTrainer(Trainer):
@@ -94,6 +95,8 @@ class ConicaTrainer(Trainer):
         results["cider"] = ciders
         meteor, meteors = Meteor().compute_score(gts, res)
         results["meteor"] = meteor
+        spice, spices = Spice().compute_score(gts, res)
+        results["spice"] = spice
         return results
 
     def compute_training_cider(self, inputs: EvalPrediction):
@@ -106,7 +109,7 @@ class ConicaTrainer(Trainer):
                                                   clean_up_tokenization_spaces=False)
         _gts = []
         for _ in gts:
-            _ = self.tokenizer.batch_encode_plus(_, add_special_tokens=False,max_length=62,truncation=True)
+            _ = self.tokenizer.batch_encode_plus(_, add_special_tokens=False, max_length=62, truncation=True)
             _ = self.tokenizer.batch_decode(_.input_ids, skip_special_tokens=True,
                                             clean_up_tokenization_spaces=False)
 

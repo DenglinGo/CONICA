@@ -2,6 +2,12 @@
 # @Time : 2022/6/2 下午1:05
 # @Author : Lingo
 # @File : prepro_ngrams.py
+
+import os
+import sys
+
+root_path = os.path.abspath(__file__)
+sys.path.append('/'.join(root_path.split('/')[:-2]))
 from utils.cider import CiderScorer
 from transformers import AutoTokenizer
 
@@ -79,11 +85,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
     # input json
-    parser.add_argument('--input_csv', default='/dataset/caption/flickr30k.csv',
+    parser.add_argument('-input_csv', default='/dataset/caption/flickr30k.csv',
                         help='input json file to process into hdf5')
-    parser.add_argument('--output_pkl', default='flickr30k-train', help='output pickle file')
-    parser.add_argument('--split', default='train', help='test, val, train, all')
-    parser.add_argument("--tokenizer", default="../conica-clip")
+    parser.add_argument('-output_pkl', default='flickr30k-train', help='output pickle file')
+    parser.add_argument('-split', default='train', help='test, val, train, all')
+    parser.add_argument("-tokenizer", default="../conica-clip")
     args = parser.parse_args()
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
     params = vars(args)  # convert to ordinary dict

@@ -2,7 +2,10 @@
 # @Time : 2022/6/2 上午12:55
 # @Author : Lingo
 # @File : prepro_datasets.py
+import sys,os
 
+root_path = os.path.abspath(__file__)
+sys.path.append('/'.join(root_path.split('/')[:-2]))
 from tqdm import tqdm
 import pandas as pd
 import warnings

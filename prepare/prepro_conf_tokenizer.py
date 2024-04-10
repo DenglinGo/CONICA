@@ -39,7 +39,7 @@ if __name__ == "__main__":
                         help="The minimum frequency a word should appear in corpus")
     parser.add_argument('-pretrained_tokenizer_name', type=str, default="openai/clip-vit-large-patch14",
                         help="the name of tokenizer, e.g, 'openai/clip-vit-large-patch14' ")
-    parser.add_argument("-d_vision", type=int, default=2048)
+    parser.add_argument("-d_vision", type=int, default=1024)
     parser.add_argument("-d_model", type=int, default=512)
     parser.add_argument("-d_align", type=int, default=128)
     parser.add_argument("-n_head", type=int, default=8)

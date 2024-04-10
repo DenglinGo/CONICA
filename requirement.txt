@@ -170,4 +170,4 @@ xz=5.2.5=h7f8727e_1
 zc-lockfile=3.0.post1=pypi_0
 zipp=3.8.0=pypi_0
 zlib=1.2.12=h7f8727e_2
-zstd=1.5.2=ha4553b6_0
+zstd=1.5.2=ha4553b6_00
